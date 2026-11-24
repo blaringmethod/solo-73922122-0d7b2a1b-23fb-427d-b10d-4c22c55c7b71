@@ -201,9 +201,157 @@
   </div>
 </section>
 
-<!-- 6. 签单台账 -->
+<!-- 6. 回炉转料暂用估值恢复（查档） -->
+<section class="card" id="recovery">
+  <h2>⑥ 回炉转料暂用估值恢复（查档）
+    <span class="tag">勾选待恢复转料 → 生成最少耗时调档清单 → 一次录齐实称 → 另存逐笔恢复重量</span>
+  </h2>
+  {% if not transfers %}
+    <p class="muted">本账套没有转料记录，无需恢复。</p>
+  {% else %}
+  <p class="small muted">
+    勾选项的原估值视为缺失；未勾选项按账面重量参与守恒推算。同一对炉之间的转料逐笔核算。
+    清单按账套保存，换账后回到本账套可续办。
+  </p>
+
+  <!-- 6.1 勾选与耗时 -->
+  <form method="post" action="{{ url_for('recovery_plan') }}">
+    <input type="hidden" name="ledger_id" value="{{ view_ledger_id }}">
+    <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>待恢复</th><th>记录#</th><th>源炉</th><th>目标炉</th>
+          <th class="num">暂用估值(kg)</th><th>调阅耗时(分钟)</th><th>无法调阅</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for t in transfers %}
+        {% set it = rec_item_map.get(t.id) %}
+        <tr>
+          <td><input type="checkbox" name="sel" value="{{ t.id }}" {{ 'checked' if it }}></td>
+          <td class="num muted">{{ t.id }}</td>
+          <td class="code">{{ t.src_furnace }}</td>
+          <td class="code">→ {{ t.dst_furnace }}</td>
+          <td class="num">{{ t.weight_kg }}</td>
+          <td>
+            <input type="number" name="min_{{ t.id }}" min="1" step="1"
+                   value="{{ it.minutes if it and it.minutes is not none else '' }}"
+                   placeholder="正整数">
+          </td>
+          <td><input type="checkbox" name="na_{{ t.id }}" value="1"
+                     {{ 'checked' if it and it.minutes is none }}></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+    <div class="sticky-act">
+      <button type="submit">保存勾选并生成调档清单</button>
+      {% if rec_list %}
+        <button type="submit" form="recovery-clear-form" class="danger">清空清单与恢复结果</button>
+      {% endif %}
+    </div>
+  </form>
+  {% if rec_list %}
+    <form id="recovery-clear-form" method="post" action="{{ url_for('recovery_clear') }}"
+          onsubmit="return confirm('确认清空本账套的调档清单与恢复结果？');">
+      <input type="hidden" name="ledger_id" value="{{ view_ledger_id }}">
+    </form>
+  {% endif %}
+
+  <!-- 6.2 调档清单与录入 -->
+  {% if rec_list %}
+    {% if not rec_list.feasible %}
+      <div class="solution-box fail" style="margin-top:12px">
+        <strong>可调阅的磅单全部找回仍无法推全。</strong><br>
+        互相牵制的一组转料：{{ rec_list.cycle_note }}
+      </div>
+    {% else %}
+      <div class="solution-box" style="margin-top:12px">
+        <strong>调档清单：{{ rec_retrieve|length }} 张磅单，总耗时 {{ rec_list.total_minutes }} 分钟（总耗时最少）。</strong><br>
+        {% if rec_retrieve %}
+          需调档实查：
+          {% for it in rec_retrieve %}
+            <span class="ok-pill amber">#{{ it.transfer_id }} {{ transfer_map[it.transfer_id].src_furnace }}→{{ transfer_map[it.transfer_id].dst_furnace }} · {{ it.minutes }}分钟</span>
+          {% endfor %}
+          <br>
+        {% endif %}
+        {% if rec_derive %}
+          拿到实称后可唯一推算：
+          {% for it in rec_derive %}
+            <span class="ok-pill gray">#{{ it.transfer_id }} {{ transfer_map[it.transfer_id].src_furnace }}→{{ transfer_map[it.transfer_id].dst_furnace }}{{ '（无法调阅）' if it.minutes is none }}</span>
+          {% endfor %}
+        {% else %}
+          全部勾选笔均需实查，无待推算项。
+        {% endif %}
+      </div>
+      <form method="post" action="{{ url_for('recovery_entry') }}" style="margin-top:12px">
+        <input type="hidden" name="ledger_id" value="{{ view_ledger_id }}">
+        {% if rec_retrieve %}
+        <div class="table-wrap">
+        <table>
+          <thead><tr><th>记录#</th><th>源炉</th><th>目标炉</th><th class="num">暂用估值(kg)</th><th>实称公斤数</th></tr></thead>
+          <tbody>
+          {% for it in rec_retrieve %}
+            {% set t = transfer_map[it.transfer_id] %}
+            <tr>
+              <td class="num muted">{{ it.transfer_id }}</td>
+              <td class="code">{{ t.src_furnace }}</td>
+              <td class="code">→ {{ t.dst_furnace }}</td>
+              <td class="num">{{ t.weight_kg }}</td>
+              <td>
+                <input type="number" name="act_{{ it.transfer_id }}" min="0" step="1"
+                       value="{{ it.actual_kg if it.actual_kg is not none else '' }}"
+                       placeholder="非负整数" required>
+              </td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+        </div>
+        {% endif %}
+        <button type="submit">一次录齐实称并保存恢复结果</button>
+        <span class="small muted">全部恢复值为非负整数且各炉平衡时才落库；失败保留已有清单与恢复结果。</span>
+      </form>
+    {% endif %}
+  {% endif %}
+
+  <!-- 6.3 恢复结果 -->
+  {% if rec_values %}
+    <h3 style="margin:16px 0 8px">已存恢复结果（{{ rec_values|length }} 笔）</h3>
+    <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>记录#</th><th>源炉</th><th>目标炉</th><th class="num">暂用估值(kg)</th>
+            <th class="num">恢复重量(kg)</th><th>来源</th><th>保存时间</th></tr>
+      </thead>
+      <tbody>
+      {% for v in rec_values %}
+        {% set t = transfer_map[v.transfer_id] %}
+        <tr>
+          <td class="num muted">{{ v.transfer_id }}</td>
+          <td class="code">{{ t.src_furnace }}</td>
+          <td class="code">→ {{ t.dst_furnace }}</td>
+          <td class="num">{{ t.weight_kg }}</td>
+          <td class="num"><strong>{{ v.recovered_kg }}</strong></td>
+          <td>
+            {% if v.source == '实查' %}<span class="ok-pill green">实查</span>
+            {% else %}<span class="ok-pill amber">推算</span>{% endif %}
+          </td>
+          <td class="small">{{ v.saved_at }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+  {% endif %}
+  {% endif %}
+</section>
+
+<!-- 7. 签单台账 -->
 <section class="card">
-  <h2>⑥ 签单台账（含已撤销历史）</h2>
+  <h2>⑦ 签单台账（含已撤销历史）</h2>
   <div class="table-wrap">
   <table>
     <thead><tr><th>签单#</th><th>出货批号</th><th class="num">最低再生料(kg)</th><th>状态</th><th>签发时间</th><th>撤销时间</th></tr></thead>
@@ -232,9 +380,9 @@
 </section>
 {% endif %}
 
-<!-- 7. 审计日志 -->
+<!-- 8. 审计日志 -->
 <section class="card">
-  <h2>⑦ 最近操作日志</h2>
+  <h2>⑧ 最近操作日志</h2>
   <div class="table-wrap">
   <table>
     <thead><tr><th>时间(UTC)</th><th>动作</th><th>明细</th><th>结果</th></tr></thead>

@@ -96,9 +96,42 @@ CREATE TABLE IF NOT EXISTS audit_log (
     success INTEGER NOT NULL
 );
 
+-- 查档恢复清单：每账套一份，重新生成即覆盖；录入/保存失败时保留旧清单。
+CREATE TABLE IF NOT EXISTS recovery_lists (
+    ledger_id INTEGER PRIMARY KEY REFERENCES ledgers(id) ON DELETE CASCADE,
+    feasible INTEGER NOT NULL DEFAULT 1,
+    total_minutes INTEGER NOT NULL DEFAULT 0,
+    cycle_note TEXT,
+    updated_at TEXT NOT NULL
+);
+
+-- 清单明细：勾选的待恢复转料。minutes 为 NULL 表示无法调阅；
+-- retrieve=1 表示列入调档清单（需实查），=0 表示留待推算。
+CREATE TABLE IF NOT EXISTS recovery_items (
+    id INTEGER PRIMARY KEY,
+    ledger_id INTEGER NOT NULL REFERENCES ledgers(id) ON DELETE CASCADE,
+    transfer_id INTEGER NOT NULL,
+    minutes INTEGER,
+    retrieve INTEGER NOT NULL DEFAULT 0,
+    actual_kg INTEGER,
+    UNIQUE (ledger_id, transfer_id)
+);
+
+-- 恢复结果：逐笔重量并标明 实查/推算（另存，不改账套原估值）。
+CREATE TABLE IF NOT EXISTS recovery_values (
+    id INTEGER PRIMARY KEY,
+    ledger_id INTEGER NOT NULL REFERENCES ledgers(id) ON DELETE CASCADE,
+    transfer_id INTEGER NOT NULL,
+    recovered_kg INTEGER NOT NULL CHECK (recovered_kg >= 0),
+    source TEXT NOT NULL CHECK (source IN ('实查', '推算')),
+    saved_at TEXT NOT NULL,
+    UNIQUE (ledger_id, transfer_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_batches_ledger ON batches(ledger_id);
 CREATE INDEX IF NOT EXISTS idx_transfers_ledger ON transfers(ledger_id);
 CREATE INDEX IF NOT EXISTS idx_cert_active ON certificates(active);
+CREATE INDEX IF NOT EXISTS idx_recovery_items_ledger ON recovery_items(ledger_id);
 """
 
 
@@ -216,3 +249,89 @@ def solution_details(
         (solution_id,),
     ).fetchall()
     return sb, st
+
+
+# ----------------------------------------------------------------------
+# 查档恢复（回炉转料暂用估值）
+# ----------------------------------------------------------------------
+
+def save_recovery_plan(
+    conn: sqlite3.Connection,
+    ledger_id: int,
+    feasible: bool,
+    total_minutes: int,
+    cycle_note: Optional[str],
+    items: Iterable[Tuple[int, Optional[int], bool]],
+) -> None:
+    """覆盖保存某账套的调档清单（调用方已在事务中）。
+
+    items: (transfer_id, minutes, retrieve)。清单变更后旧的恢复结果不再
+    对应新的未知集，一并作废；失败时调用方回滚，旧清单与旧结果原样保留。
+    """
+    conn.execute("DELETE FROM recovery_lists WHERE ledger_id = ?", (ledger_id,))
+    conn.execute("DELETE FROM recovery_items WHERE ledger_id = ?", (ledger_id,))
+    conn.execute("DELETE FROM recovery_values WHERE ledger_id = ?", (ledger_id,))
+    conn.execute(
+        "INSERT INTO recovery_lists(ledger_id, feasible, total_minutes, cycle_note, "
+        "updated_at) VALUES (?, ?, ?, ?, ?)",
+        (ledger_id, 1 if feasible else 0, total_minutes, cycle_note, utcnow_iso()),
+    )
+    conn.executemany(
+        "INSERT INTO recovery_items(ledger_id, transfer_id, minutes, retrieve, "
+        "actual_kg) VALUES (?, ?, ?, ?, NULL)",
+        [(ledger_id, tid, minutes, 1 if retrieve else 0)
+         for tid, minutes, retrieve in items],
+    )
+
+
+def load_recovery_plan(
+    conn: sqlite3.Connection, ledger_id: int
+) -> Tuple[Optional[sqlite3.Row], List[sqlite3.Row]]:
+    lst = conn.execute(
+        "SELECT * FROM recovery_lists WHERE ledger_id = ?", (ledger_id,)
+    ).fetchone()
+    items = conn.execute(
+        "SELECT * FROM recovery_items WHERE ledger_id = ? ORDER BY transfer_id",
+        (ledger_id,),
+    ).fetchall()
+    return lst, items
+
+
+def save_recovery_actuals(
+    conn: sqlite3.Connection, ledger_id: int, actuals: Iterable[Tuple[int, int]]
+) -> None:
+    """把档案员录入的实称公斤数记到清单明细上（调用方已在事务中）。"""
+    conn.executemany(
+        "UPDATE recovery_items SET actual_kg = ? "
+        "WHERE ledger_id = ? AND transfer_id = ?",
+        [(kg, ledger_id, tid) for tid, kg in actuals],
+    )
+
+
+def save_recovery_values(
+    conn: sqlite3.Connection,
+    ledger_id: int,
+    values: Iterable[Tuple[int, int, str]],
+) -> None:
+    """覆盖保存恢复结果（调用方已在事务中）。values: (transfer_id, kg, source)。"""
+    conn.execute("DELETE FROM recovery_values WHERE ledger_id = ?", (ledger_id,))
+    conn.executemany(
+        "INSERT INTO recovery_values(ledger_id, transfer_id, recovered_kg, source, "
+        "saved_at) VALUES (?, ?, ?, ?, ?)",
+        [(ledger_id, tid, kg, src, utcnow_iso()) for tid, kg, src in values],
+    )
+
+
+def load_recovery_values(
+    conn: sqlite3.Connection, ledger_id: int
+) -> List[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM recovery_values WHERE ledger_id = ? ORDER BY transfer_id",
+        (ledger_id,),
+    ).fetchall()
+
+
+def clear_recovery(conn: sqlite3.Connection, ledger_id: int) -> None:
+    """清空某账套的清单与恢复结果（调用方已在事务中）。"""
+    for tbl in ("recovery_values", "recovery_items", "recovery_lists"):
+        conn.execute(f"DELETE FROM {tbl} WHERE ledger_id = ?", (ledger_id,))

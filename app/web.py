@@ -14,6 +14,10 @@ from flask import (
 )
 
 from . import csvutil, db
+from .recovery import (
+    RecoveryError, UnknownTransfer, check_all_balanced, derive_weights,
+    plan_retrieval,
+)
 from .solver import (
     CertRequirement, FurnaceBatchLink, FurnaceInput, SolveError, TransferInput,
     solve_allocation,
@@ -90,6 +94,9 @@ def create_app() -> Flask:
             sol_row = None
             sol_batches = sol_transfers = []
             ledger_row = None
+            rec_list = None
+            rec_items = []
+            rec_values = []
             if view_ledger_id:
                 ledger_row = conn.execute(
                     "SELECT * FROM ledgers WHERE id = ?", (view_ledger_id,)
@@ -101,6 +108,8 @@ def create_app() -> Flask:
                         sol_batches, sol_transfers = db.solution_details(
                             conn, sol_row["id"]
                         )
+                    rec_list, rec_items = db.load_recovery_plan(conn, view_ledger_id)
+                    rec_values = db.load_recovery_values(conn, view_ledger_id)
             certs = conn.execute(
                 "SELECT * FROM certificates ORDER BY active DESC, signed_at DESC, id DESC"
             ).fetchall()
@@ -111,6 +120,12 @@ def create_app() -> Flask:
             cert_map = {c["batch_code"]: c for c in certs if c["active"]}
             sol_batch_map = {r["batch_code"]: r["recycled_kg"] for r in sol_batches}
             sol_transfer_map = {r["transfer_id"]: r["recycled_kg"] for r in sol_transfers}
+
+            # 查档恢复：清单明细、调档/推算分组与已存恢复结果
+            rec_item_map = {i["transfer_id"]: i for i in rec_items}
+            rec_retrieve = [i for i in rec_items if i["retrieve"]]
+            rec_derive = [i for i in rec_items if not i["retrieve"]]
+            transfer_map = {t["id"]: t for t in transfers}
 
             # 每炉物料平衡（账套原值，供页面核对“总进料=总出料”）
             balance = {}
@@ -144,6 +159,13 @@ def create_app() -> Flask:
                 sol_row=sol_row,
                 sol_batch_map=sol_batch_map,
                 sol_transfer_map=sol_transfer_map,
+                rec_list=rec_list,
+                rec_items=rec_items,
+                rec_item_map=rec_item_map,
+                rec_retrieve=rec_retrieve,
+                rec_derive=rec_derive,
+                rec_values=rec_values,
+                transfer_map=transfer_map,
                 logs=logs,
             )
         finally:
@@ -344,6 +366,189 @@ def create_app() -> Flask:
             return redirect(url_for("index"))
         finally:
             conn.close()
+
+    # ------------------------------------------------------------------
+    @app.route("/recovery/plan", methods=["POST"])
+    def recovery_plan():
+        """保存勾选并生成最少耗时的调档清单（按账套落库，换账可续办）。"""
+        ledger_id = request.form.get("ledger_id", type=int)
+        try:
+            conn = db.get_conn()
+            try:
+                ledger = conn.execute(
+                    "SELECT * FROM ledgers WHERE id = ?", (ledger_id,)
+                ).fetchone()
+                if not ledger:
+                    raise CsvConflict("账套不存在，无法保存清单。")
+                _, _, transfers = db.load_ledger(conn, ledger_id)
+                by_id = {t["id"]: t for t in transfers}
+                selected = set()
+                for raw in request.form.getlist("sel"):
+                    try:
+                        tid = int(raw)
+                    except (TypeError, ValueError):
+                        continue
+                    if tid in by_id:
+                        selected.add(tid)
+                if not selected:
+                    raise CsvConflict("请至少勾选一笔待恢复的转料。")
+                unknowns = []
+                for tid in sorted(selected):
+                    t = by_id[tid]
+                    if request.form.get(f"na_{tid}") == "1":
+                        minutes = None
+                    else:
+                        raw_min = (request.form.get(f"min_{tid}") or "").strip()
+                        try:
+                            minutes = int(raw_min)
+                            if minutes <= 0:
+                                raise ValueError
+                        except ValueError:
+                            raise CsvConflict(
+                                f"转料#{tid}（{t['src_furnace']}→{t['dst_furnace']}）"
+                                "需填写正整数分钟的调阅耗时，或勾选“无法调阅”。"
+                            )
+                    unknowns.append(UnknownTransfer(
+                        tid, t["src_furnace"], t["dst_furnace"], minutes,
+                    ))
+                plan = plan_retrieval(unknowns)
+                with db.transaction(conn):
+                    db.save_recovery_plan(
+                        conn, ledger_id, plan.ok, plan.total_minutes,
+                        plan.cycle_note or None,
+                        [(u.tid, u.minutes, u.tid in set(plan.retrieve_ids))
+                         for u in unknowns],
+                    )
+                    if plan.ok:
+                        db.log_event(
+                            conn, "recovery_plan",
+                            f"账套#{ledger_id} 调档清单 {len(plan.retrieve_ids)} 张，"
+                            f"总耗时 {plan.total_minutes} 分钟", True,
+                        )
+                    else:
+                        db.log_event(
+                            conn, "recovery_plan",
+                            f"账套#{ledger_id} 无法推全：{plan.cycle_note}", True,
+                        )
+            finally:
+                conn.close()
+        except CsvConflict as exc:
+            flash(f"清单保存失败，已有清单与恢复结果保留：{exc}", "error")
+            _log_failure("recovery_plan", f"账套#{ledger_id} 清单被拒：{exc}")
+            return redirect(url_for("index", ledger=ledger_id, _anchor="recovery"))
+        if plan.ok:
+            flash(
+                f"调档清单已保存：需调阅 {len(plan.retrieve_ids)} 张磅单，"
+                f"总耗时 {plan.total_minutes} 分钟（已是最少）；"
+                f"其余 {len(plan.keep_ids)} 笔待推算。", "ok",
+            )
+        else:
+            flash("可调阅磅单全部找回仍无法推全：" + plan.cycle_note, "error")
+        return redirect(url_for("index", ledger=ledger_id, _anchor="recovery"))
+
+    # ------------------------------------------------------------------
+    @app.route("/recovery/entry", methods=["POST"])
+    def recovery_entry():
+        """一次录齐清单实称公斤数，推算其余并另存逐笔恢复重量。
+
+        任一校验失败即整体回滚：已有清单与既有恢复结果全部保留。
+        """
+        ledger_id = request.form.get("ledger_id", type=int)
+        try:
+            conn = db.get_conn()
+            try:
+                with db.transaction(conn):
+                    ledger = conn.execute(
+                        "SELECT * FROM ledgers WHERE id = ?", (ledger_id,)
+                    ).fetchone()
+                    if not ledger:
+                        raise CsvConflict("账套不存在。")
+                    rec_list, items = db.load_recovery_plan(conn, ledger_id)
+                    if not rec_list:
+                        raise CsvConflict("该账套还没有调档清单，请先勾选生成。")
+                    if not rec_list["feasible"]:
+                        raise CsvConflict("当前清单无法推全，请调整勾选后重新生成。")
+                    measured = {}
+                    for it in items:
+                        if not it["retrieve"]:
+                            continue
+                        tid = it["transfer_id"]
+                        raw = (request.form.get(f"act_{tid}") or "").strip()
+                        try:
+                            v = int(raw)
+                            if v < 0:
+                                raise ValueError
+                        except ValueError:
+                            raise CsvConflict(
+                                f"请一次录齐：转料#{tid} 的实称公斤数必须是非负整数。"
+                            )
+                        measured[tid] = v
+                    furnaces, batches, transfers = db.load_ledger(conn, ledger_id)
+                    checked_ids = {i["transfer_id"] for i in items}
+                    f_in = [(f["code"], f["primary_kg"], f["recycled_kg"])
+                            for f in furnaces]
+                    b_in = [(b["furnace_code"], b["weight_kg"]) for b in batches]
+                    known, unknown = [], []
+                    for t in transfers:
+                        tid = t["id"]
+                        if tid in checked_ids:
+                            if tid in measured:
+                                known.append((t["src_furnace"], t["dst_furnace"],
+                                              measured[tid]))
+                            else:
+                                unknown.append((tid, t["src_furnace"],
+                                                t["dst_furnace"]))
+                        else:
+                            known.append((t["src_furnace"], t["dst_furnace"],
+                                          t["weight_kg"]))
+                    try:
+                        derived = derive_weights(f_in, b_in, known, unknown)
+                    except RecoveryError as exc:
+                        raise CsvConflict(str(exc))
+                    all_t = known + [
+                        (src, dst, derived[tid]) for tid, src, dst in unknown
+                    ]
+                    problem = check_all_balanced(f_in, b_in, all_t)
+                    if problem:
+                        raise CsvConflict(problem)
+                    db.save_recovery_actuals(conn, ledger_id, measured.items())
+                    values = [(tid, kg, "实查") for tid, kg in sorted(measured.items())]
+                    values += [(tid, kg, "推算") for tid, kg in sorted(derived.items())]
+                    db.save_recovery_values(conn, ledger_id, values)
+                    db.log_event(
+                        conn, "recovery_entry",
+                        f"账套#{ledger_id} 恢复 {len(values)} 笔"
+                        f"（实查 {len(measured)}，推算 {len(derived)}）", True,
+                    )
+            finally:
+                conn.close()
+        except CsvConflict as exc:
+            flash(f"恢复保存失败，已有清单与恢复结果保留：{exc}", "error")
+            _log_failure("recovery_entry", f"账套#{ledger_id} 录入被拒（回滚）：{exc}")
+            return redirect(url_for("index", ledger=ledger_id, _anchor="recovery"))
+        flash(
+            f"恢复完成：实查 {len(measured)} 笔、推算 {len(derived)} 笔，"
+            "逐笔重量已另存并标明来源。", "ok",
+        )
+        return redirect(url_for("index", ledger=ledger_id, _anchor="recovery"))
+
+    # ------------------------------------------------------------------
+    @app.route("/recovery/clear", methods=["POST"])
+    def recovery_clear():
+        """清空该账套的调档清单与恢复结果，重新勾选。"""
+        ledger_id = request.form.get("ledger_id", type=int)
+        conn = db.get_conn()
+        try:
+            with db.transaction(conn):
+                db.clear_recovery(conn, ledger_id)
+                db.log_event(
+                    conn, "recovery_clear",
+                    f"账套#{ledger_id} 清单与恢复结果已清空", True,
+                )
+            flash("已清空该账套的调档清单与恢复结果，可重新勾选。", "ok")
+        finally:
+            conn.close()
+        return redirect(url_for("index", ledger=ledger_id, _anchor="recovery"))
 
     @app.get("/healthz")
     def healthz():
